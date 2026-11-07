@@ -1,0 +1,12 @@
+{
+  "name": "access-hub-next-ui-tests",
+  "private": true,
+  "scripts": {
+    "test:ui": "node tests/ui_smoke.cjs"
+  },
+  "devDependencies": {
+    "@sparticuz/chromium": "^138.0.2",
+    "jsdom": "26.1.0",
+    "playwright-core": "^1.54.2"
+  }
+}
