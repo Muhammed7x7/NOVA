@@ -155,10 +155,13 @@ def deploy(app_dir: Path, backup_parent: Path, vendor: Path, service: Service) -
                   'release':str(release),'app_mode':mode,'port':getattr(service,'port',None)}
         (saved/'deploy-manifest.json').write_text(json.dumps(manifest,indent=2)+'\n')
         os.chmod(saved/'deploy-manifest.json',0o600)
-        _replace_file(app_file,wrapper,mode);switched=True
+        # Mark intent before the atomic swap so an interrupt immediately after
+        # os.replace still restores the verified original rather than deleting
+        # the release that the new wrapper depends on.
+        switched=True
+        _replace_file(app_file,wrapper,mode)
         service.start()
         service.healthy(candidate=True)
-        stopped=False
         return saved
     except BaseException as exc:
         # Source-only recovery keeps newer DB changes. It is valid only because
@@ -205,8 +208,9 @@ def rollback(app_dir: Path, backup_dir: Path, service: Service) -> None:
             _legacy_credentials(con)
             if con.execute('PRAGMA quick_check').fetchone()[0]!='ok':
                 raise DeploymentError('Current database integrity check failed')
-        _replace_file(app_file,(backup_dir/'app.py').read_bytes(),mode);switched=True
-        service.start();service.healthy(candidate=False);stopped=False
+        switched=True
+        _replace_file(app_file,(backup_dir/'app.py').read_bytes(),mode)
+        service.start();service.healthy(candidate=False)
     except BaseException as exc:
         if stopped:
             try:

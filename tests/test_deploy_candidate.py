@@ -308,3 +308,26 @@ class DeploySimulationTests(unittest.TestCase):
                     'ExecStart':'{ path=/usr/bin/python3 ; argv[]=/usr/bin/python3 /tmp/unexpected.py ; }'}
             return SimpleNamespace(stdout=values[field]+'\n')
         with self.assertRaises(ServiceCheckError):SystemdService(self.app,runner=run).inspect_config_stopped(self.port)
+    def test_deploy_interrupt_immediately_after_atomic_swap_restores_original(self):
+        from unittest.mock import patch
+        actual=deploy._replace_file;calls=0
+        def interrupted(target,content,mode):
+            nonlocal calls
+            calls+=1;actual(target,content,mode)
+            if calls==1:raise InterruptedError('immediately after swap')
+        with patch.object(deploy,'_replace_file',side_effect=interrupted):
+            with self.assertRaises(deploy.DeploymentError):deploy.deploy(self.app,self.backups,self.vendor,self.service)
+        self.assertEqual(deploy.file_sha256(self.app/'app.py'),deploy.KNOWN_SOURCE_SHA256)
+        self.service.healthy(False)
+    def test_rollback_interrupt_immediately_after_atomic_swap_restores_candidate(self):
+        from unittest.mock import patch
+        saved=deploy.deploy(self.app,self.backups,self.vendor,self.service)
+        actual=deploy._replace_file;calls=0
+        def interrupted(target,content,mode):
+            nonlocal calls
+            calls+=1;actual(target,content,mode)
+            if calls==1:raise InterruptedError('immediately after swap')
+        with patch.object(deploy,'_replace_file',side_effect=interrupted):
+            with self.assertRaises(deploy.DeploymentError):deploy.rollback(self.app,saved,self.service)
+        self.assertNotEqual(deploy.file_sha256(self.app/'app.py'),deploy.KNOWN_SOURCE_SHA256)
+        self.service.healthy(True)
