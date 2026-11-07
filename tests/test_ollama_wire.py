@@ -26,5 +26,5 @@ class OllamaWireTests(unittest.TestCase):
         FakeOllama.requests.clear()
         result=chat.request_ollama('model:test',[{'role':'user','content':'Merhaba'}],'Yerel talimat')
         self.assertEqual(result,'fake local response')
-        path,data=FakeOllama.requests[0];self.assertEqual(path,'/api/chat');self.assertEqual(data['model'],'model:test');self.assertFalse(data['stream'])
+        path,data=FakeOllama.requests[0];self.assertEqual(path,'/api/chat');self.assertEqual(data['model'],'model:test');self.assertFalse(data['stream']);self.assertEqual(data['options']['num_predict'],512)
         self.assertEqual(data['messages'],[{'role':'system','content':'Yerel talimat'},{'role':'user','content':'Merhaba'}])

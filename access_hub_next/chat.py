@@ -7,6 +7,7 @@ from access_hub_next import models, rbac
 
 MAX_PROMPT = 6000
 MAX_CONTEXT = 30000
+MAX_OUTPUT_TOKENS = 512
 INFERENCE_SLOT = threading.BoundedSemaphore(1)
 
 
@@ -26,7 +27,7 @@ def messages_for(con, user_id, conversation_id):
 
 def request_ollama(tag, messages, system_prompt):
     items = ([{'role':'system','content':system_prompt}] if system_prompt else []) + messages
-    body = json.dumps({'model':tag,'messages':items,'stream':False}, ensure_ascii=False).encode('utf-8')
+    body = json.dumps({'model':tag,'messages':items,'stream':False,'options':{'num_predict':MAX_OUTPUT_TOKENS}}, ensure_ascii=False).encode('utf-8')
     req = Request('http://127.0.0.1:11434/api/chat', data=body, headers={'Content-Type':'application/json'}, method='POST')
     if not INFERENCE_SLOT.acquire(blocking=False):
         raise BlockingIOError('Model şu anda başka bir istekle meşgul')
