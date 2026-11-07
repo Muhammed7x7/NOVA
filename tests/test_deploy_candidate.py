@@ -204,3 +204,72 @@ class DeploySimulationTests(unittest.TestCase):
         with self.assertRaises(InterruptedError):
             with recover_on_disconnect():os.kill(os.getpid(),signal.SIGTERM)
         self.assertIs(signal.getsignal(signal.SIGTERM),old)
+
+    def test_systemd_adapter_only_accepts_allowlisted_units(self):
+        from tools.systemd_adapter import SystemdService,ServiceCheckError
+        self.assertEqual(SystemdService(self.app,unit='nova-rehearsal-0123456789abcdef.service').unit,'nova-rehearsal-0123456789abcdef.service')
+        for name in ['ssh.service','access-hub.service;evil','nova-rehearsal-abcd.service','../access-hub.service']:
+            with self.assertRaises(ServiceCheckError):SystemdService(self.app,unit=name)
+    def test_isolated_rehearsal_orchestration_without_real_systemd(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from tools import rehearse_systemd, backup as backup_tool
+        from tools.systemd_adapter import SystemdService
+        with tempfile.TemporaryDirectory(prefix='nova-rehearsal-test-',dir=Path.home()) as parent:
+            parent=Path(parent);systemd=parent/'systemd';systemd.mkdir()
+            copied=backup_tool.backup(self.app,parent)
+            state={'service':None}
+            def sudo(*args):
+                if args==('true',):return
+                if args[0]=='install':shutil.copyfile(args[-2],args[-1]);return
+                if args[:2]==('systemctl','daemon-reload'):return
+                if args[:2]==('systemctl','stop'):
+                    if state['service']:state['service'].stop()
+                    return
+                if args[0]=='rm':Path(args[-1]).unlink(missing_ok=True);return
+                raise AssertionError(args)
+            def service_factory(app,unit):
+                config=(systemd/unit).read_text()
+                port=int(next(line.split('=',2)[2] for line in config.splitlines() if line.startswith('Environment=ACCESS_HUB_PORT=')))
+                process=LocalProcessService(app,port);state['service']=process
+                def runner(args,**kwargs):
+                    if args[0]=='systemctl' and 'is-active' in args:
+                        if process.process is None or process.process.poll() is not None:raise subprocess.CalledProcessError(3,args)
+                        return SimpleNamespace(stdout='active\n')
+                    if args[0]=='systemctl' and 'show' in args:return SimpleNamespace(stdout=str(process.process.pid)+'\n')
+                    if args[:3]==['sudo','-n','systemctl'] and args[3]=='stop':process.stop();return SimpleNamespace(stdout='')
+                    if args[:3]==['sudo','-n','systemctl'] and args[3]=='start':process.start();return SimpleNamespace(stdout='')
+                    raise AssertionError(args)
+                return SystemdService(app,runner=runner,unit=unit)
+            with patch.object(rehearse_systemd,'_SYSTEMD_DIR',systemd),patch.object(rehearse_systemd,'_sudo',side_effect=sudo),patch.object(rehearse_systemd,'SystemdService',side_effect=service_factory):
+                result=rehearse_systemd.run(copied,parent,self.vendor)
+            self.assertTrue(result.is_dir())
+            self.assertEqual(list(systemd.iterdir()),[])
+            self.assertEqual(deploy.file_sha256(self.app/'app.py'),deploy.KNOWN_SOURCE_SHA256)
+            self.assertIsNotNone(self.legacy.authenticate_admin('test-password-123'))
+    def test_rehearsal_rejects_tampered_backup(self):
+        from tools import rehearse_systemd, backup as backup_tool
+        with tempfile.TemporaryDirectory(prefix='nova-rehearsal-test-',dir=Path.home()) as parent:
+            parent=Path(parent);copied=backup_tool.backup(self.app,parent)
+            (copied/'access_hub.sqlite3').write_bytes(b'tampered')
+            with self.assertRaises(ValueError):rehearse_systemd._prepare_clone(copied,parent)
+    def test_rehearsal_removes_temporary_unit_after_test_failure(self):
+        from unittest.mock import patch
+        from tools import rehearse_systemd, backup as backup_tool
+        with tempfile.TemporaryDirectory(prefix='nova-rehearsal-test-',dir=Path.home()) as parent:
+            parent=Path(parent);systemd=parent/'systemd';systemd.mkdir();copied=backup_tool.backup(self.app,parent)
+            events=[]
+            def sudo(*args):
+                events.append(args)
+                if args[0]=='install':shutil.copyfile(args[-2],args[-1])
+                elif args[0]=='rm':Path(args[-1]).unlink(missing_ok=True)
+            class FakeAdapter:
+                port=None
+                def __init__(self,*args,**kwargs):pass
+                def start(self):pass
+                def healthy(self,*args,**kwargs):pass
+                def inspect(self):pass
+            with patch.object(rehearse_systemd,'_SYSTEMD_DIR',systemd),patch.object(rehearse_systemd,'_sudo',side_effect=sudo),patch.object(rehearse_systemd,'SystemdService',FakeAdapter),patch.object(rehearse_systemd,'_test_logins',side_effect=RuntimeError('test failure')):
+                with self.assertRaisesRegex(RuntimeError,'test failure'):rehearse_systemd.run(copied,parent,self.vendor)
+            self.assertEqual(list(systemd.iterdir()),[])
+            self.assertTrue(any(a[:2]==('systemctl','stop') for a in events))

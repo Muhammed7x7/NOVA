@@ -8,11 +8,15 @@ import time
 import urllib.error
 import urllib.request
 import json
+import re
 
 class ServiceCheckError(RuntimeError): pass
 
 class SystemdService:
-    def __init__(self, app_dir: Path, *, runner=subprocess.run):
+    def __init__(self, app_dir: Path, *, runner=subprocess.run, unit='access-hub.service'):
+        if unit != 'access-hub.service' and not re.fullmatch(r'nova-rehearsal-[0-9a-f]{16}\.service',unit):
+            raise ServiceCheckError('Unsupported service unit')
+        self.unit=unit
         self.app_dir=app_dir.resolve(strict=True)
         self._run=runner
         self.port=None
@@ -20,12 +24,12 @@ class SystemdService:
     def _command(self, argv, timeout=15):
         return self._run(argv, check=True, text=True, capture_output=True, timeout=timeout)
     def _pid(self):
-        result=self._command(['systemctl','--no-pager','show','access-hub.service','-p','MainPID','--value'])
+        result=self._command(['systemctl','--no-pager','show',self.unit,'-p','MainPID','--value'])
         value=result.stdout.strip()
         if not value.isdigit() or int(value)<=0:raise ServiceCheckError('Service PID unavailable')
         return int(value)
     def _active(self):
-        result=self._command(['systemctl','--no-pager','is-active','access-hub.service'])
+        result=self._command(['systemctl','--no-pager','is-active',self.unit])
         if result.stdout.strip()!='active':raise ServiceCheckError('Service is not active')
     def inspect(self):
         if os.getuid()==0:raise ServiceCheckError('Run as the service user, not root')
@@ -64,9 +68,9 @@ class SystemdService:
             if value.startswith('socket:[') and value[8:-1] in inodes:return
         raise ServiceCheckError('Loopback listener is not owned by service process')
     def stop(self):
-        self._command(['sudo','-n','systemctl','stop','access-hub.service'],timeout=30)
+        self._command(['sudo','-n','systemctl','stop',self.unit],timeout=30)
     def start(self):
-        self._command(['sudo','-n','systemctl','start','access-hub.service'],timeout=30)
+        self._command(['sudo','-n','systemctl','start',self.unit],timeout=30)
     def healthy(self,candidate):
         if self.port is None:raise ServiceCheckError('Service preflight missing')
         deadline=time.monotonic()+20;last=None
