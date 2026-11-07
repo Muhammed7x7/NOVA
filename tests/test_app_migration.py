@@ -291,3 +291,29 @@ class HttpAuthorizationTests(unittest.TestCase):
         self.assertNotIn('private',capture.getvalue())
         self.assertNotIn('/secret',capture.getvalue())
         self.assertIn('/[redacted]',capture.getvalue())
+
+    def test_repo_lab_can_be_delegated_without_admin_access(self):
+        import http.client, json
+        user=self.app.admin_create_user({'role':'standard','username':'developer','display_name':'Developer','credential':'dev-password'})
+        cookie='access_hub='+self.app.create_session(user['id'])
+        c=http.client.HTTPConnection('127.0.0.1',self.server.server_port)
+        headers={'Content-Type':'application/json','Cookie':cookie}
+        def command():
+            c.request('POST','/api/admin/maviorkide/lab-command',json.dumps({'command':'echo ok','cwd':'.'}),headers)
+            response=c.getresponse();response.read();return response.status
+        self.assertEqual(command(),403)
+        with self.app.connect() as db:
+            role=self.app.rbac.create_role(db,1,{'key':'repo-user','display_name':'Repo User'})
+            self.app.rbac.set_role_permissions(db,1,role,['tools.terminal'])
+            self.app.rbac.link(db,1,'user-role',user['id'],role,True)
+        self.assertEqual(command(),403)
+        with self.app.connect() as db:
+            self.app.rbac.set_role_permissions(db,1,role,['tools.terminal','tools.repo.command'])
+        with patch.object(self.app,'mavi_repo_lab_command',return_value={'cwd':'.','output':'ok','exit_code':0}):
+            self.assertEqual(command(),200)
+        c.request('GET','/api/admin/state',headers={'Cookie':cookie})
+        response=c.getresponse();response.read();self.assertEqual(response.status,401)
+        with self.app.connect() as db:
+            self.app.rbac.set_role_permissions(db,1,role,['tools.terminal'])
+        self.assertEqual(command(),403)
+        c.close()

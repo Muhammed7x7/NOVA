@@ -35,7 +35,7 @@ def main():
         user=app.admin_create_user({'role':'standard','username':'tester','display_name':'Test User','credential':'tester-password'})
         with app.connect() as db:
             role=rbac.create_role(db,1,{'key':'agent-user','display_name':'Agent User'})
-            rbac.set_role_permissions(db,1,role,['portal.view','agent.chat','agent.history','agent.models.use'])
+            rbac.set_role_permissions(db,1,role,['portal.view','agent.chat','agent.history','agent.models.use','tools.terminal','tools.repo.command'])
             rbac.link(db,1,'user-role',user['id'],role,True)
             models.configure(db,1,{'tag':'test:model','display_name':'Test model','active':True,'default_model':True,'role_ids':[role]}, {'test:model'})
         try: fake=ThreadingHTTPServer(('127.0.0.1',11434),FakeOllama)

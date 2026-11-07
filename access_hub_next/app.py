@@ -727,8 +727,36 @@ def _mavi_workspace_size() -> int:
     return total
 
 def _mavi_lab_container_state() -> dict[str, object]:
-    output = _command(["docker", "inspect", "--format", "{{.State.Running}}", MAVI_LAB_CONTAINER], timeout=6).strip()
-    return {"running": output == "true", "workspace_bytes": _mavi_workspace_size(), "workspace_limit": MAVI_LAB_WORKSPACE_LIMIT}
+    # Fail closed when inspection fails or the isolation configuration drifts.
+    # Inspection is not proof of isolation; in particular, network and kernel risks remain.
+    running, safe = False, False
+    try:
+        result = subprocess.run(["docker", "inspect", MAVI_LAB_CONTAINER], shell=False, check=True,
+                                capture_output=True, text=True, timeout=6)
+        if len(result.stdout) > 1_000_000: raise ValueError("inspect output too large")
+        entry = json.loads(result.stdout)[0]
+        host = entry["HostConfig"]
+        mounts = entry.get("Mounts", [])
+        running = bool(entry.get("State", {}).get("Running"))
+        safe = (
+            os.getuid() != 0 and host.get("Privileged") is False
+            and host.get("ReadonlyRootfs") is True
+            and "ALL" in (host.get("CapDrop") or []) and not host.get("CapAdd")
+            and not host.get("Devices") and not host.get("DeviceRequests") and not host.get("DeviceCgroupRules")
+            and any(str(x).lower() in {"no-new-privileges", "no-new-privileges:true"}
+                    for x in (host.get("SecurityOpt") or []))
+            and not any("unconfined" in str(x).lower() for x in (host.get("SecurityOpt") or []))
+            and host.get("NetworkMode") not in (None, "host", "container")
+            and not str(host.get("NetworkMode", "")).startswith("container:")
+            and host.get("PidMode") != "host" and host.get("IpcMode") != "host"
+            and int(host.get("Memory") or 0) > 0 and int(host.get("PidsLimit") or 0) > 0
+            and len(mounts) == 1 and mounts[0].get("Type") == "bind"
+            and mounts[0].get("Destination") == "/workspace"
+            and Path(mounts[0].get("Source", "")).resolve() == MAVIORKIDE_ROOT
+        )
+    except (OSError, ValueError, KeyError, IndexError, TypeError, subprocess.SubprocessError):
+        pass
+    return {"running": running, "boundary_safe": safe, "workspace_bytes": _mavi_workspace_size(), "workspace_limit": MAVI_LAB_WORKSPACE_LIMIT}
 
 def mavi_repo_lab_status() -> dict[str, object]:
     status = _mavi_lab_container_state()
@@ -756,6 +784,8 @@ def mavi_repo_lab_command(command: str, cwd_value: object) -> dict[str, object]:
     state = _mavi_lab_container_state()
     if not state["running"]:
         raise ValueError("Maviorkide Repo Laboratuvarı çalışmıyor")
+    if not state.get("boundary_safe"):
+        raise ValueError("Repo Laboratuvarı güvenlik yapılandırması doğrulanamadı")
     if int(state["workspace_bytes"]) >= MAVI_LAB_WORKSPACE_LIMIT:
         raise ValueError("Maviorkide çalışma alanı 10 GB güvenlik sınırına ulaştı")
     relative = _mavi_relative(cwd)
@@ -900,10 +930,12 @@ q('#specialOpen').onclick=openSpecial;q('#specialClose').onclick=()=>q('#special
 """
 
 PRIVATE_BODY = r"""
-<button class="normal-menu-toggle" id="normalMenuToggle" aria-label="Menüyü aç">☰</button><aside class="normal-drawer" id="normalDrawer"><button class="icon-btn drawer-close" id="normalMenuClose" aria-label="Menüyü kapat">×</button><div class="brand">ÖZEL ALAN</div><div class="tag">Kullanıcı menüsü</div><nav style="display:grid;gap:9px;margin-top:28px"><button class="nav-btn active">Ana alan</button><button class="nav-btn hidden" id="privateAgentOpen">Agent Sohbet</button><button class="nav-btn" id="logout">Çıkış yap</button></nav></aside><main class="private"><section class="panel"><div class="eyebrow">Erişim doğrulandı</div><h1>Hoş geldiniz.</h1><p class="muted">Özel alanınız etkin. Kullanıcı araçları buraya rolünüze göre eklenecektir.</p></section></main><script>const d=document.querySelector('#normalDrawer');document.querySelector('#normalMenuToggle').onclick=()=>d.classList.add('open');document.querySelector('#normalMenuClose').onclick=()=>d.classList.remove('open');document.querySelector('#logout').onclick=async()=>{await fetch('/api/logout',{method:'POST'});location.href='/'};</script>
+<button class="normal-menu-toggle" id="normalMenuToggle" aria-label="Menüyü aç">☰</button><aside class="normal-drawer" id="normalDrawer"><button class="icon-btn drawer-close" id="normalMenuClose" aria-label="Menüyü kapat">×</button><div class="brand">ÖZEL ALAN</div><div class="tag">Kullanıcı menüsü</div><nav style="display:grid;gap:9px;margin-top:28px"><button class="nav-btn active">Ana alan</button><button class="nav-btn hidden" id="privateAgentOpen">Agent Sohbet</button><button class="nav-btn hidden" id="privateRepoOpen">Repo Lab Terminal</button><button class="nav-btn" id="logout">Çıkış yap</button></nav></aside><main class="private"><section class="panel"><div class="eyebrow">Erişim doğrulandı</div><h1>Hoş geldiniz.</h1><p class="muted">Özel alanınız etkin. Kullanıcı araçları buraya rolünüze göre eklenecektir.</p></section></main><script>const d=document.querySelector('#normalDrawer');document.querySelector('#normalMenuToggle').onclick=()=>d.classList.add('open');document.querySelector('#normalMenuClose').onclick=()=>d.classList.remove('open');document.querySelector('#logout').onclick=async()=>{await fetch('/api/logout',{method:'POST'});location.href='/'};</script>
+<div id="privateRepo" class="modal-backdrop hidden"><section class="panel modal"><div class="modal-head"><h2 class="section-title">Repo Lab Terminal</h2><button class="icon-btn" id="privateRepoClose" aria-label="Kapat">×</button></div><p class="muted">Komutlar yalnızca izinli Repo Lab konteynerinde çalışır.</p><pre id="privateRepoOutput" class="lab-terminal" aria-live="polite"></pre><form id="privateRepoForm"><div class="field"><label for="privateRepoInput">Komut</label><input id="privateRepoInput" maxlength="4000" autocomplete="off" required></div><button class="btn primary">Çalıştır</button><p id="privateRepoNotice" class="notice"></p></form></section></div>
+<script>(()=>{const q=s=>document.querySelector(s);let cwd='.';q('#privateRepoOpen').onclick=()=>{q('#privateRepo').classList.remove('hidden');q('#normalDrawer').classList.remove('open')};q('#privateRepoClose').onclick=()=>q('#privateRepo').classList.add('hidden');q('#privateRepoForm').onsubmit=async e=>{e.preventDefault();const btn=e.target.querySelector('button');btn.disabled=true;try{const command=q('#privateRepoInput').value;const r=await fetch('/api/admin/maviorkide/lab-command',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({command,cwd})});const data=await r.json();if(!r.ok)throw Error(data.error||'Komut başarısız');cwd=data.cwd;q('#privateRepoOutput').textContent+=`\n${cwd} $ ${command}\n${data.output}\n`;q('#privateRepoInput').value='';q('#privateRepoNotice').textContent='Çıkış kodu: '+data.exit_code}catch(error){q('#privateRepoNotice').textContent=error.message}finally{btn.disabled=false}}})();</script>
 <div id="privateAgent" class="modal-backdrop hidden"><section class="panel modal"><div class="modal-head"><h2 class="section-title">Yerel Agent Sohbeti</h2><button class="icon-btn" id="privateAgentClose" aria-label="Kapat">×</button></div><div class="field"><label>Model</label><select id="privateAgentModel"></select></div><div class="field"><label>Konuşmalar</label><select id="privateAgentHistory"><option value="">Yeni konuşma</option></select></div><button class="btn" id="privateAgentNew">Yeni konuşma</button> <button class="btn danger" id="privateAgentDelete">Seçili konuşmayı sil</button><pre id="privateAgentMessages" style="white-space:pre-wrap;overflow-wrap:anywhere;max-height:35vh;overflow:auto"></pre><form id="privateAgentForm"><div class="field"><label>Mesaj</label><textarea id="privateAgentInput" maxlength="6000" required></textarea></div><button class="btn primary">Gönder</button><p id="privateAgentNotice" class="notice"></p></form></section></div>
 <script>(()=>{const q=x=>document.querySelector(x);let conversation=null;const text=(el,v)=>{el.textContent=v};async function get(url){const r=await fetch(url),d=await r.json();if(!r.ok)throw Error(d.error||'İşlem başarısız');return d}async function post(url,data){const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)}),d=await r.json();if(!r.ok)throw Error(d.error||'İşlem başarısız');return d}function option(select,value,label){const o=document.createElement('option');o.value=value;o.textContent=label;select.append(o)}async function refresh(){const m=await get('/api/agent/models'),sel=q('#privateAgentModel'),old=sel.value;sel.replaceChildren();option(sel,'','Model seçin');m.models.forEach(x=>option(sel,x.tag,x.display_name));sel.value=m.models.some(x=>x.tag===old)?old:(m.models.find(x=>x.default_model)?.tag||'');try{const h=await get('/api/agent/conversations'),box=q('#privateAgentHistory');box.replaceChildren();option(box,'','Yeni konuşma');h.conversations.forEach(x=>option(box,String(x.id),x.title));box.value=conversation||''}catch(e){q('#privateAgentHistory').replaceChildren();option(q('#privateAgentHistory'),'','Geçmiş kapalı')}}
-get('/api/profile').then(d=>{if(d.permissions.includes('agent.chat')&&d.permissions.includes('agent.models.use'))q('#privateAgentOpen').classList.remove('hidden')}).catch(()=>{});q('#privateAgentOpen').onclick=async()=>{q('#privateAgent').classList.remove('hidden');q('#normalDrawer').classList.remove('open');try{await refresh()}catch(e){text(q('#privateAgentNotice'),e.message)}};q('#privateAgentClose').onclick=()=>q('#privateAgent').classList.add('hidden');q('#privateAgentDelete').onclick=async()=>{if(!conversation||!confirm('Bu konuşma silinsin mi?'))return;try{const r=await fetch('/api/agent/conversations/'+conversation,{method:'DELETE'});if(!r.ok)throw Error('Konuşma silinemedi');conversation=null;text(q('#privateAgentMessages'),'');await refresh()}catch(e){text(q('#privateAgentNotice'),e.message)}};q('#privateAgentNew').onclick=()=>{conversation=null;q('#privateAgentHistory').value='';text(q('#privateAgentMessages'),'')};q('#privateAgentHistory').onchange=async e=>{conversation=e.target.value?Number(e.target.value):null;text(q('#privateAgentMessages'),'');if(conversation)try{const d=await get('/api/agent/conversations/'+conversation);text(q('#privateAgentMessages'),d.messages.map(x=>(x.role==='user'?'Sen: ':'Agent: ')+x.content).join('\n\n'))}catch(x){text(q('#privateAgentNotice'),x.message)}};q('#privateAgentForm').onsubmit=async e=>{e.preventDefault();const button=e.target.querySelector('button');button.disabled=true;try{const message=q('#privateAgentInput').value,model=q('#privateAgentModel').value;if(!model)throw Error('Model seçin');text(q('#privateAgentNotice'),'Yanıt bekleniyor…');const d=await post('/api/agent/chat',{model,message,conversation_id:conversation});q('#privateAgentMessages').textContent+=(q('#privateAgentMessages').textContent?'\n\n':'')+'Sen: '+message+'\n\nAgent: '+d.answer;q('#privateAgentInput').value='';conversation=d.conversation_id;await refresh();text(q('#privateAgentNotice'),'Yanıt alındı.')}catch(x){text(q('#privateAgentNotice'),x.message)}finally{button.disabled=false}}})();</script>
+get('/api/profile').then(d=>{if(d.permissions.includes('agent.chat')&&d.permissions.includes('agent.models.use'))q('#privateAgentOpen').classList.remove('hidden');if(d.permissions.includes('tools.terminal')&&d.permissions.includes('tools.repo.command'))q('#privateRepoOpen').classList.remove('hidden')}).catch(()=>{});q('#privateAgentOpen').onclick=async()=>{q('#privateAgent').classList.remove('hidden');q('#normalDrawer').classList.remove('open');try{await refresh()}catch(e){text(q('#privateAgentNotice'),e.message)}};q('#privateAgentClose').onclick=()=>q('#privateAgent').classList.add('hidden');q('#privateAgentDelete').onclick=async()=>{if(!conversation||!confirm('Bu konuşma silinsin mi?'))return;try{const r=await fetch('/api/agent/conversations/'+conversation,{method:'DELETE'});if(!r.ok)throw Error('Konuşma silinemedi');conversation=null;text(q('#privateAgentMessages'),'');await refresh()}catch(e){text(q('#privateAgentNotice'),e.message)}};q('#privateAgentNew').onclick=()=>{conversation=null;q('#privateAgentHistory').value='';text(q('#privateAgentMessages'),'')};q('#privateAgentHistory').onchange=async e=>{conversation=e.target.value?Number(e.target.value):null;text(q('#privateAgentMessages'),'');if(conversation)try{const d=await get('/api/agent/conversations/'+conversation);text(q('#privateAgentMessages'),d.messages.map(x=>(x.role==='user'?'Sen: ':'Agent: ')+x.content).join('\n\n'))}catch(x){text(q('#privateAgentNotice'),x.message)}};q('#privateAgentForm').onsubmit=async e=>{e.preventDefault();const button=e.target.querySelector('button');button.disabled=true;try{const message=q('#privateAgentInput').value,model=q('#privateAgentModel').value;if(!model)throw Error('Model seçin');text(q('#privateAgentNotice'),'Yanıt bekleniyor…');const d=await post('/api/agent/chat',{model,message,conversation_id:conversation});q('#privateAgentMessages').textContent+=(q('#privateAgentMessages').textContent?'\n\n':'')+'Sen: '+message+'\n\nAgent: '+d.answer;q('#privateAgentInput').value='';conversation=d.conversation_id;await refresh();text(q('#privateAgentNotice'),'Yanıt alındı.')}catch(x){text(q('#privateAgentNotice'),x.message)}finally{button.disabled=false}}})();</script>
 """
 
 ADMIN_BODY = r"""
@@ -1060,9 +1092,8 @@ class Handler(BaseHTTPRequestHandler):
             return None
         return user
 
-    def require_admin_permission(self, permission: str) -> dict[str, object] | None:
-        # Legacy admin gate remains in place until delegated-access UI is ready.
-        user = self.require_user(admin=True)
+    def require_permission(self, permission: str, *, admin: bool = False) -> dict[str, object] | None:
+        user = self.require_user(admin=admin)
         if not user:
             return None
         with DB_LOCK, connect() as con:
@@ -1071,6 +1102,10 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(HTTPStatus.FORBIDDEN, {"error": "Bu işlem için yetkiniz yok"})
             return None
         return user
+
+    def require_admin_permission(self, permission: str) -> dict[str, object] | None:
+        # Administrative management remains restricted to legacy administrators.
+        return self.require_permission(permission, admin=True)
 
     def body_json(self) -> dict[str, object]:
         content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
@@ -1213,7 +1248,7 @@ class Handler(BaseHTTPRequestHandler):
             if self.require_admin_permission("system.status"):
                 self.send_json(HTTPStatus.OK, system_overview())
         elif path == "/api/admin/maviorkide/lab-status":
-            if self.require_admin_permission("tools.terminal"):
+            if self.require_permission("tools.terminal"):
                 self.send_json(HTTPStatus.OK, mavi_repo_lab_status())
         else:
             self.send_bytes(HTTPStatus.NOT_FOUND, b"Bulunamadi", "text/plain; charset=utf-8")
@@ -1341,8 +1376,8 @@ class Handler(BaseHTTPRequestHandler):
                 data = self.body_json()
                 self.send_json(HTTPStatus.OK, maviorkide_terminal(str(data.get("command", "")), data.get("cwd", ".")))
             elif path == "/api/admin/maviorkide/lab-command":
-                if not self.require_admin_permission("tools.terminal"): return
-                if not self.require_admin_permission("tools.repo.command"): return
+                if not self.require_permission("tools.terminal"): return
+                if not self.require_permission("tools.repo.command"): return
                 data = self.body_json()
                 self.send_json(HTTPStatus.OK, mavi_repo_lab_command(str(data.get("command", "")), data.get("cwd", ".")))
             elif path == "/api/admin/settings":

@@ -23,7 +23,9 @@ if(!/^http:\/\/127\.0\.0\.1:\d+$/.test(base||'')) throw Error('Only a temporary 
   browser=await playwright.launch({executablePath:await chromium.executablePath(),args,headless:true});
   const mobile=await browser.newContext({viewport:{width:390,height:844},isMobile:true,hasTouch:true}),mp=await mobile.newPage();mp.on('pageerror',e=>errors.push(e.message));
   await mp.goto(base);await mp.locator('#standardForm [name=username]').fill('tester');await mp.locator('#standardForm [name=key]').fill('tester-password');await mp.locator('#standardForm button').click();await mp.waitForURL('**/private');
-  await mp.locator('#normalMenuToggle').click();await mp.locator('#privateAgentOpen').click();await mp.locator('#privateAgentModel option[value="test:model"]').waitFor({state:"attached"});await mp.locator('#privateAgentModel').selectOption('test:model');
+  await mp.locator('#normalMenuToggle').click();await mp.locator('#privateRepoOpen').click();
+  await mp.locator('#privateRepoInput').fill('echo hello');await mp.locator('#privateRepoForm button').click();await mp.locator('#privateRepoNotice').getByText('Maviorkide Repo Laboratuvarı çalışmıyor').waitFor();
+  await mp.locator('#privateRepoClose').click();await mp.locator('#normalMenuToggle').click();await mp.locator('#privateAgentOpen').click();await mp.locator('#privateAgentModel option[value="test:model"]').waitFor({state:"attached"});await mp.locator('#privateAgentModel').selectOption('test:model');
   await mp.locator('#privateAgentInput').fill('telefondan');await mp.locator('#privateAgentForm button').click();await mp.locator('#privateAgentMessages').getByText('Yanıt: telefondan').waitFor();
   await mp.locator('#privateAgentClose').click();await mp.locator('#profileToggle').click();await mp.locator('#profileIdentity').getByText('tester').waitFor();
   const png=Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAUAAAAFCAIAAAACDbGyAAAAFElEQVR4nGNkYPjPgASYGFABqXwATpMBCb/kZHAAAAAASUVORK5CYII=','base64');

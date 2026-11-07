@@ -38,3 +38,7 @@ For staging and evaluation only, setting `ACCESS_HUB_LEGACY_CREDENTIAL_COMPAT=1`
 ## UI test layers
 
 `npm ci` installs test-only JavaScript dependencies. `PYTHON=.venv/bin/python npm run test:ui` runs a simulated DOM smoke test. `.venv/bin/python tests/browser_integration.py` runs headless Chromium against a temporary SQLite database and a **fake** local Ollama HTTP service (requires available loopback port 11434, compatible Chromium system libraries including NSS/NSPR, and the npm dev dependencies). Neither test contacts the Oracle server or proves real Docker/OpenClaw/Ollama isolation.
+
+## Repo Lab boundary checks
+
+Only authenticated users with both `tools.terminal` and `tools.repo.command` may run a Repo Lab command. Non-admin users can access this delegated terminal without acquiring access-management permissions. Before executing a command, the app inspects the named container and refuses to run if its expected non-root, capability, mount, resource or namespace configuration is missing. These checks are configuration checks, not proof of container isolation; they do not verify network isolation, Docker daemon security, kernel vulnerabilities, or prevent a privileged Docker operator from replacing a container between inspection and execution. The running service must itself use a non-root UID. Administrative management endpoints remain restricted to legacy admin accounts.
