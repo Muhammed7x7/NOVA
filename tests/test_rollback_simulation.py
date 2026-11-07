@@ -51,3 +51,21 @@ class RollbackSimulationTests(unittest.TestCase):
                 app.admin_change_password(1,'temporary-password-123','changed-admin-password')
             self.assertIsNotNone(legacy.authenticate_admin('changed-admin-password'))
             self.assertIsNotNone(legacy.authenticate_standard('new-user','reset-password'))
+
+    def test_legacy_created_users_are_backfilled_after_reupgrade_without_regranting_revoked_roles(self):
+        with tempfile.TemporaryDirectory() as root:
+            data=Path(root)/'data';data.mkdir();repo=Path(__file__).resolve().parents[1]
+            spec=importlib.util.spec_from_file_location('legacy_reupgrade',repo/'baseline'/'app.py')
+            legacy=importlib.util.module_from_spec(spec);spec.loader.exec_module(legacy)
+            legacy.DATA_DIR=data;legacy.DB_PATH=data/'access_hub.sqlite3'
+            with patch.dict('os.environ',{'INITIAL_ADMIN_PASSWORD':'temporary-password-123'}):legacy.init_db()
+            old=legacy.admin_create_user({'username':'previous','display_name':'Previous','role':'standard','credential':'previous-password'})
+            with patch.object(app,'DATA_DIR',data),patch.object(app,'DB_PATH',legacy.DB_PATH),patch.object(app,'LEGACY_CREDENTIAL_COMPAT',True):
+                app.init_db()
+                with app.connect() as db:db.execute('DELETE FROM nova_user_roles WHERE user_id=?',(old['id'],))
+                fresh=legacy.admin_create_user({'username':'created-later','display_name':'Created Later','role':'standard','credential':'created-password'})
+                app.init_db()
+                with app.connect() as db:
+                    self.assertEqual(app.rbac.effective_permissions(db,old['id']),set())
+                    self.assertEqual(app.rbac.effective_permissions(db,fresh['id']),{'portal.view'})
+                self.assertIsNotNone(app.authenticate_standard('created-later','created-password'))

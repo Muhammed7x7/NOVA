@@ -169,3 +169,38 @@ class DeploySimulationTests(unittest.TestCase):
         service=SystemdService(self.app,runner=run)
         with self.assertRaises(RuntimeError):deploy_preflight.run_preflight(self.app,self.vendor,self.backups,service,lambda:{'running':True,'boundary_safe':False})
         service.healthy(False)
+    def test_cli_preflight_apply_and_rollback_with_simulated_systemctl(self):
+        from types import SimpleNamespace
+        from tools import deploy_cli
+        from tools.systemd_adapter import SystemdService
+        def run(args,**kwargs):
+            if args[0]=='systemctl' and 'is-active' in args:
+                if self.service.process is None or self.service.process.poll() is not None:raise subprocess.CalledProcessError(3,args)
+                return SimpleNamespace(stdout='active\n')
+            if args[0]=='systemctl' and 'show' in args:return SimpleNamespace(stdout=str(self.service.process.pid)+'\n')
+            if args[:3]==['sudo','-n','systemctl'] and args[3]=='stop':self.service.stop();return SimpleNamespace(stdout='')
+            if args[:3]==['sudo','-n','systemctl'] and args[3]=='start':self.service.start();return SimpleNamespace(stdout='')
+            raise AssertionError(args)
+        adapter=SystemdService(self.app,runner=run)
+        lab=lambda:{'running':True,'boundary_safe':True}
+        test_backups=self.root/'cli-backups'
+        staged=deploy_cli.execute('preflight',self.app,test_backups,self.vendor,adapter,lab_inspector=lab)
+        self.assertTrue((staged/'candidate-data.sqlite3').exists())
+        saved=deploy_cli.execute('apply',self.app,test_backups,self.vendor,adapter,lab_inspector=lab,sudo_check=lambda:None)
+        self.assertNotEqual(deploy.file_sha256(self.app/'app.py'),deploy.KNOWN_SOURCE_SHA256)
+        deploy_cli.execute('rollback',self.app,test_backups,self.vendor,adapter,rollback_dir=saved,sudo_check=lambda:None)
+        self.assertEqual(deploy.file_sha256(self.app/'app.py'),deploy.KNOWN_SOURCE_SHA256)
+        self.assertIsNotNone(self.legacy.authenticate_standard('legacy','legacy-key-123'))
+    def test_cli_refuses_public_backup_parent_before_service_calls(self):
+        from tools import deploy_cli
+        public=self.root/'public';public.mkdir(mode=0o755);os.chmod(public,0o755)
+        with self.assertRaises(ValueError):deploy_cli.execute('apply',self.app,public,self.vendor,None)
+        self.service.healthy(False)
+
+    def test_disconnect_signal_becomes_exception_and_handlers_are_restored(self):
+        import signal
+        from tools.deploy_cli import recover_on_disconnect
+        old=signal.getsignal(signal.SIGTERM)
+        with self.assertRaises(InterruptedError):
+            with recover_on_disconnect():os.kill(os.getpid(),signal.SIGTERM)
+        self.assertIs(signal.getsignal(signal.SIGTERM),old)

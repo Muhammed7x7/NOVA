@@ -60,6 +60,18 @@ def migrate(con: sqlite3.Connection) -> None:
             con.execute('INSERT INTO nova_user_roles SELECT id, CASE WHEN role = ? THEN ? ELSE ? END FROM users', ('admin', owner, basic))
             con.execute('INSERT INTO nova_profiles(user_id) SELECT id FROM users')
             con.execute('INSERT INTO nova_migrations VALUES (?,?)', ('rbac-v1', int(time.time())))
+        # The legacy app can create accounts while the candidate is rolled back.
+        # Candidate-created accounts always have profiles, so only accounts lacking
+        # profiles are backfilled. Never restore deliberately removed roles for an
+        # existing profile, which would silently re-grant access.
+        owner = con.execute('SELECT id FROM nova_roles WHERE role_key=? AND system_role=1', ('system-owner',)).fetchone()
+        basic = con.execute('SELECT id FROM nova_roles WHERE role_key=? AND system_role=1', ('basic-access',)).fetchone()
+        if owner is None or basic is None:
+            raise ValueError('Required system roles are missing')
+        con.execute("""INSERT INTO nova_user_roles(user_id,role_id)
+            SELECT u.id, CASE WHEN u.role=? THEN ? ELSE ? END FROM users u
+            LEFT JOIN nova_profiles p ON p.user_id=u.id WHERE p.user_id IS NULL""", ('admin', owner[0], basic[0]))
+        con.execute('INSERT INTO nova_profiles(user_id) SELECT u.id FROM users u LEFT JOIN nova_profiles p ON p.user_id=u.id WHERE p.user_id IS NULL')
         con.execute('RELEASE SAVEPOINT nova_migration')
     except Exception:
         con.execute('ROLLBACK TO SAVEPOINT nova_migration')
