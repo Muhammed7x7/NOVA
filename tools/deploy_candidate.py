@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Experimental deployment/rollback building blocks. Not production-approved.
 
-Only a service-specific adapter should call deploy(). The supplied API deliberately
-has no command-line entry point, so it cannot accidentally alter a running server.
+Only a service-specific adapter should call deploy(). The separate operator CLI
+is experimental and must not be treated as production-approved.
 """
 from __future__ import annotations
 
@@ -152,7 +152,7 @@ def deploy(app_dir: Path, backup_parent: Path, vendor: Path, service: Service) -
         _validate_copy(scratch)
         manifest={'format':1,'baseline_sha256':KNOWN_SOURCE_SHA256,
                   'wrapper_sha256':hashlib.sha256(wrapper).hexdigest(),
-                  'release':str(release),'app_mode':mode}
+                  'release':str(release),'app_mode':mode,'port':getattr(service,'port',None)}
         (saved/'deploy-manifest.json').write_text(json.dumps(manifest,indent=2)+'\n')
         os.chmod(saved/'deploy-manifest.json',0o600)
         _replace_file(app_file,wrapper,mode);switched=True

@@ -11,6 +11,7 @@ const user={id:1,username:'admin',display_name:'Admin',role:'admin',active:true}
 const settings={brand_text:'Test',surface_brightness:'18'};
 const inventory={inventory:[{name:'mock:1',size:10}],configured:[],roles:[],groups:[]};
 const responses={
+ '/api/admin/audit':{events:[{id:1,actor_username:'<img src=x>',event_type:'user.created',subject_type:'user',subject_id:'2',created_at:1}],next_before:null},
  '/api/profile':{user,permissions:['agent.chat','agent.models.use','agent.history'],roles:[],groups:[]},
  '/api/admin/access/roles':{roles:[role],grants:[],permissions:['agent.chat','portal.view']},
  '/api/admin/access/groups':{groups:[group],members:[],roles:[]},
@@ -38,6 +39,7 @@ function create(name){
  assert(d.querySelector('#roleList').textContent.includes('Yazar'));
  assert(d.querySelector('#view-roles').classList.contains('active'));
  d.querySelector('[data-view="groups"]').click();await wait();assert(d.querySelector('#groupList').textContent.includes('Ekip'));
+ d.querySelector('[data-view="audit"]').click();await wait();assert(d.querySelector('#auditList').textContent.includes('user.created'));assert.equal(d.querySelector('#auditList img'),null);
  d.querySelector('[data-view="agentmodels"]').click();await wait();assert(d.querySelector('#agentModelTag').textContent.includes('mock:1'));
  d.querySelector('[data-view="agentchat"]').click();await wait();assert(d.querySelector('#chatModel').textContent.includes('Test model'));
  d.querySelector('#profileToggle').click();await wait();assert.equal(d.querySelector('#profileOverlay').hidden,false);assert.equal(d.querySelector('#profileName').value,'Admin');

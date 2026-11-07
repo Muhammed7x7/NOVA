@@ -101,7 +101,7 @@ class HttpAuthorizationTests(unittest.TestCase):
         status, _, _ = post('/api/admin/access/assignment', {'kind':'group-role','left':group,'right':role,'enabled':True}, cookie)
         self.assertEqual(status, 200)
         with self.app.connect() as db:
-            self.assertEqual(db.execute('SELECT count(*) FROM nova_audit_events').fetchone()[0], 4)
+            self.assertEqual(db.execute('SELECT count(*) FROM nova_audit_events').fetchone()[0], 5)
         client.close()
 
     def test_profile_only_allows_display_name(self):
@@ -311,9 +311,79 @@ class HttpAuthorizationTests(unittest.TestCase):
             self.app.rbac.set_role_permissions(db,1,role,['tools.terminal','tools.repo.command'])
         with patch.object(self.app,'mavi_repo_lab_command',return_value={'cwd':'.','output':'ok','exit_code':0}):
             self.assertEqual(command(),200)
+        with self.app.connect() as db:
+            event=db.execute("SELECT actor_user_id,subject_id,detail FROM nova_audit_events WHERE event_type='repo.command.requested'").fetchone()
+            self.assertEqual((event[0],event[1],event[2]),(user['id'],str(user['id']),''))
         c.request('GET','/api/admin/state',headers={'Cookie':cookie})
         response=c.getresponse();response.read();self.assertEqual(response.status,401)
         with self.app.connect() as db:
             self.app.rbac.set_role_permissions(db,1,role,['tools.terminal'])
         self.assertEqual(command(),403)
+        c.close()
+
+    def test_deactivation_permanently_revokes_old_sessions(self):
+        user=self.app.admin_create_user({'role':'standard','username':'suspendme','display_name':'Suspend Me','credential':'secure-key-123'})
+        token=self.app.create_session(user['id'])
+        self.assertIsNotNone(self.app.session_user(token))
+        self.app.admin_set_user_active(user['id'],False,1)
+        self.assertIsNone(self.app.session_user(token))
+        self.app.admin_set_user_active(user['id'],True,1)
+        self.assertIsNone(self.app.session_user(token))
+        self.assertIsNotNone(self.app.authenticate_standard('suspendme','secure-key-123'))
+
+    def test_avatar_replacement_and_user_deletion_clean_only_unreferenced_images(self):
+        import base64,io
+        from PIL import Image
+        first=self.app.admin_create_user({'role':'standard','username':'pictureone','display_name':'Picture One','credential':'secret-key-123'})
+        second=self.app.admin_create_user({'role':'standard','username':'picturetwo','display_name':'Picture Two','credential':'secret-key-123'})
+        buf=io.BytesIO();Image.new('RGB',(5,5),'blue').save(buf,format='PNG');image=base64.b64encode(buf.getvalue()).decode()
+        self.app.store_avatar(first['id'],image)
+        with self.app.connect() as db:old=db.execute('SELECT avatar_filename FROM nova_profiles WHERE user_id=?',(first['id'],)).fetchone()[0]
+        self.app.store_avatar(first['id'],image)
+        with self.app.connect() as db:
+            new=db.execute('SELECT avatar_filename FROM nova_profiles WHERE user_id=?',(first['id'],)).fetchone()[0]
+            db.execute('UPDATE nova_profiles SET avatar_filename=? WHERE user_id=?',(new,second['id']))
+        directory=self.app.DATA_DIR/'avatars'
+        self.assertFalse((directory/old).exists());self.assertTrue((directory/new).exists())
+        self.app.admin_delete_user(first['id'],1);self.assertTrue((directory/new).exists())
+        self.app.admin_delete_user(second['id'],1);self.assertFalse((directory/new).exists())
+
+    def test_avatar_rejects_symlinked_storage_directory(self):
+        import base64,io
+        from PIL import Image
+        outside=Path(self.tmp.name)/'outside';outside.mkdir()
+        (self.app.DATA_DIR/'avatars').symlink_to(outside,target_is_directory=True)
+        buf=io.BytesIO();Image.new('RGB',(5,5)).save(buf,format='PNG')
+        with self.assertRaises(ValueError):self.app.store_avatar(1,base64.b64encode(buf.getvalue()).decode())
+        self.assertEqual(list(outside.iterdir()),[])
+
+    def test_audit_http_is_permission_checked_paginated_and_redacted(self):
+        import http.client,json
+        c=http.client.HTTPConnection('127.0.0.1',self.server.server_port)
+        c.request('GET','/api/admin/audit');r=c.getresponse();r.read();self.assertEqual(r.status,401)
+        c.request('POST','/api/login/special',json.dumps({'user_id':'admin','password':'test-password-123'}),{'Content-Type':'application/json'})
+        r=c.getresponse();cookie=r.getheader('Set-Cookie').split(';')[0];r.read();self.assertEqual(r.status,200)
+        with self.app.connect() as db:
+            db.executemany("INSERT INTO nova_audit_events(actor_user_id,event_type,subject_type,subject_id,detail,created_at) VALUES (1,'test.event','test','123','secret-never-return',1)",[()]*105)
+        headers={'Cookie':cookie}
+        c.request('GET','/api/admin/audit',headers=headers);r=c.getresponse();body=r.read();self.assertEqual(r.status,200)
+        data=json.loads(body);self.assertEqual(len(data['events']),100);self.assertNotIn(b'secret-never-return',body);self.assertIsNotNone(data['next_before'])
+        c.request('GET','/api/admin/audit?before='+str(data['next_before']),headers=headers);r=c.getresponse();older=json.loads(r.read());self.assertEqual(r.status,200)
+        self.assertTrue(all(x['id']<data['next_before'] for x in older['events']))
+        c.request('GET','/api/admin/audit?before=invalid',headers=headers);r=c.getresponse();r.read();self.assertEqual(r.status,400)
+        with self.app.connect() as db:db.execute("DELETE FROM nova_role_permissions WHERE permission='system.logs'")
+        c.request('GET','/api/admin/audit',headers=headers);r=c.getresponse();r.read();self.assertEqual(r.status,403)
+        c.request('POST','/api/logout',headers=headers);r=c.getresponse();r.read();self.assertEqual(r.status,200)
+        with self.app.connect() as db:
+            names=[row[0] for row in db.execute("SELECT event_type FROM nova_audit_events WHERE event_type IN ('login.succeeded','logout.succeeded') ORDER BY id")]
+        self.assertEqual(names,['login.succeeded','logout.succeeded']);c.close()
+
+    def test_private_portal_requires_explicit_permission_and_rechecks_it(self):
+        import http.client
+        user=self.app.admin_create_user({'role':'standard','username':'portaluser','display_name':'Portal User','credential':'portal-key-123'})
+        cookie='access_hub='+self.app.create_session(user['id'])
+        c=http.client.HTTPConnection('127.0.0.1',self.server.server_port);headers={'Cookie':cookie}
+        c.request('GET','/private',headers=headers);r=c.getresponse();r.read();self.assertEqual(r.status,200)
+        with self.app.connect() as db:db.execute('DELETE FROM nova_user_roles WHERE user_id=?',(user['id'],))
+        c.request('GET','/private',headers=headers);r=c.getresponse();r.read();self.assertEqual(r.status,403)
         c.close()

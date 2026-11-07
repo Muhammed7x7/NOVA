@@ -9,6 +9,8 @@ import urllib.error
 import urllib.request
 import json
 import re
+import pwd
+import shlex
 
 class ServiceCheckError(RuntimeError): pass
 
@@ -54,6 +56,26 @@ class SystemdService:
         self.mavi_root=Path(env.get('MAVIORKIDE_ROOT',str(home/'maviorkide'))).resolve()
         self._verify_listener(pid)
         return port
+    def inspect_config_stopped(self, port):
+        """Validate the unit even if no live process exists, for emergency rollback."""
+        if os.getuid()==0:raise ServiceCheckError('Run as the service user, not root')
+        if type(port) is not int or not 1<=port<=65535:raise ServiceCheckError('Invalid recorded port')
+        def property_value(name):
+            return self._command(['systemctl','--no-pager','--full','show',self.unit,'-p',name,'--value']).stdout.strip()
+        user=property_value('User')
+        try:uid=pwd.getpwnam(user).pw_uid
+        except KeyError as exc:raise ServiceCheckError('Unexpected service user') from exc
+        if uid!=os.getuid():raise ServiceCheckError('Service runs as a different user')
+        if Path(property_value('WorkingDirectory')).resolve()!=self.app_dir:raise ServiceCheckError('Unexpected service working directory')
+        command=property_value('ExecStart')
+        match=re.search(r'argv\[\]=([^;]+);',command)
+        if not match:raise ServiceCheckError('Unexpected service command line')
+        try:args=shlex.split(match.group(1))
+        except ValueError as exc:raise ServiceCheckError('Unexpected service command line') from exc
+        if len(args)!=2 or Path(args[0]).resolve()!=Path('/usr/bin/python3').resolve() or Path(args[1]).resolve()!=self.app_dir/'app.py':
+            raise ServiceCheckError('Unexpected service command line')
+        self.port=port
+
     def _verify_listener(self,pid):
         # Require the *service process* to own the loopback listener; avoids
         # treating an unrelated process on the same port as a healthy restart.

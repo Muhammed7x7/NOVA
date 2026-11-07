@@ -273,3 +273,38 @@ class DeploySimulationTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError,'test failure'):rehearse_systemd.run(copied,parent,self.vendor)
             self.assertEqual(list(systemd.iterdir()),[])
             self.assertTrue(any(a[:2]==('systemctl','stop') for a in events))
+    def test_cli_can_rollback_when_candidate_service_is_stopped(self):
+        import pwd
+        from types import SimpleNamespace
+        from tools import deploy_cli
+        from tools.systemd_adapter import SystemdService
+        def run(args,**kwargs):
+            if args[0]=='systemctl' and 'is-active' in args:
+                if self.service.process is None or self.service.process.poll() is not None:raise subprocess.CalledProcessError(3,args)
+                return SimpleNamespace(stdout='active\n')
+            if args[0]=='systemctl' and 'show' in args:
+                field=args[args.index('-p')+1]
+                values={'MainPID':str(self.service.process.pid if self.service.process else 0),
+                        'User':pwd.getpwuid(os.getuid()).pw_name,'WorkingDirectory':str(self.app),
+                        'ExecStart':f'{{ path=/usr/bin/python3 ; argv[]=/usr/bin/python3 {self.app}/app.py ; ignore_errors=no }}'}
+                return SimpleNamespace(stdout=values[field]+'\n')
+            if args[:3]==['sudo','-n','systemctl'] and args[3]=='stop':self.service.stop();return SimpleNamespace(stdout='')
+            if args[:3]==['sudo','-n','systemctl'] and args[3]=='start':self.service.start();return SimpleNamespace(stdout='')
+            raise AssertionError(args)
+        adapter=SystemdService(self.app,runner=run);lab=lambda:{'running':True,'boundary_safe':True}
+        os.chmod(self.backups,0o700)
+        saved=deploy_cli.execute('apply',self.app,self.backups,self.vendor,adapter,lab_inspector=lab,sudo_check=lambda:None)
+        self.service.stop()
+        deploy_cli.execute('rollback',self.app,self.backups,self.vendor,adapter,rollback_dir=saved,sudo_check=lambda:None)
+        self.assertEqual(deploy.file_sha256(self.app/'app.py'),deploy.KNOWN_SOURCE_SHA256)
+        self.assertIsNotNone(self.legacy.authenticate_admin('test-password-123'))
+    def test_stopped_unit_validation_rejects_unexpected_command(self):
+        import pwd
+        from types import SimpleNamespace
+        from tools.systemd_adapter import SystemdService,ServiceCheckError
+        def run(args,**kwargs):
+            field=args[args.index('-p')+1]
+            values={'User':pwd.getpwuid(os.getuid()).pw_name,'WorkingDirectory':str(self.app),
+                    'ExecStart':'{ path=/usr/bin/python3 ; argv[]=/usr/bin/python3 /tmp/unexpected.py ; }'}
+            return SimpleNamespace(stdout=values[field]+'\n')
+        with self.assertRaises(ServiceCheckError):SystemdService(self.app,runner=run).inspect_config_stopped(self.port)

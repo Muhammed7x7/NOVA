@@ -240,7 +240,7 @@ def authenticate(username: str, credential: str, permitted_roles: set[str]) -> d
     return safe_user(row) if verify_and_upgrade(row, credential) else None
 
 
-def create_session(user_id: int) -> str:
+def create_session(user_id: int, *, audit: bool = False) -> str:
     raw = secrets.token_urlsafe(40)
     with DB_LOCK, connect() as con:
         con.execute("DELETE FROM sessions WHERE expires_at < ?", (now(),))
@@ -248,6 +248,7 @@ def create_session(user_id: int) -> str:
             "INSERT INTO sessions(token_hash,user_id,expires_at,created_at) VALUES(?,?,?,?)",
             (token_hash(raw), user_id, now() + SESSION_TTL_SECONDS, now()),
         )
+        if audit: rbac._audit(con, user_id, "login.succeeded", "user", user_id)
     return raw
 
 
@@ -263,10 +264,13 @@ def session_user(raw_token: str | None) -> dict[str, object] | None:
     return safe_user(row) if row else None
 
 
-def delete_session(raw_token: str | None) -> None:
+def delete_session(raw_token: str | None, *, audit: bool = False) -> None:
     if raw_token:
         with DB_LOCK, connect() as con:
-            con.execute("DELETE FROM sessions WHERE token_hash=?", (token_hash(raw_token),))
+            digest = token_hash(raw_token)
+            row = con.execute("SELECT user_id FROM sessions WHERE token_hash=?", (digest,)).fetchone()
+            con.execute("DELETE FROM sessions WHERE token_hash=?", (digest,))
+            if audit and row: rbac._audit(con, int(row[0]), "logout.succeeded", "user", int(row[0]))
 
 
 def admin_users() -> list[dict[str, object]]:
@@ -339,16 +343,23 @@ def admin_set_user_active(user_id: int, active: bool, actor_id: int | None = Non
         if not row or row["role"] == "admin":
             raise ValueError("Yönetici hesabı buradan değiştirilemez")
         con.execute("UPDATE users SET active=? WHERE id=?", (1 if active else 0, user_id))
+        if not active:
+            # Reactivating an account must not revive sessions issued before suspension.
+            con.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
         if actor_id is not None: rbac._audit(con, actor_id, "user.status.updated", "user", user_id)
 
 
 def admin_delete_user(user_id: int, actor_id: int | None = None) -> None:
-    with DB_LOCK, connect() as con:
-        row = con.execute("SELECT role FROM users WHERE id=?", (user_id,)).fetchone()
-        if not row or row["role"] == "admin":
-            raise ValueError("Yönetici hesabı silinemez")
-        if actor_id is not None: rbac._audit(con, actor_id, "user.deleted", "user", user_id)
-        con.execute("DELETE FROM users WHERE id=?", (user_id,))
+    with DB_LOCK:
+        with connect() as con:
+            row = con.execute("SELECT role FROM users WHERE id=?", (user_id,)).fetchone()
+            if not row or row["role"] == "admin":
+                raise ValueError("Yönetici hesabı silinemez")
+            profile = con.execute("SELECT avatar_filename FROM nova_profiles WHERE user_id=?", (user_id,)).fetchone()
+            old_avatar = profile[0] if profile else ""
+            if actor_id is not None: rbac._audit(con, actor_id, "user.deleted", "user", user_id)
+            con.execute("DELETE FROM users WHERE id=?", (user_id,))
+        _discard_avatar_if_unused(old_avatar)
 
 
 def admin_reset_credential(user_id: int, credential: str, actor_id: int | None = None) -> None:
@@ -812,6 +823,22 @@ def mavi_repo_lab_command(command: str, cwd_value: object) -> dict[str, object]:
         except subprocess.TimeoutExpired:
             return {"cwd": relative, "output": "[Komut güvenlik zaman sınırında durduruldu]", "exit_code": 124}
 
+def _discard_avatar_if_unused(filename: object) -> None:
+    """Remove a previously stored image only after its DB references are gone.
+
+    Caller holds DB_LOCK; invalid names, shared files and symlinked directories are ignored.
+    """
+    if not isinstance(filename, str) or not re.fullmatch(r"[0-9a-f]{48}\.png", filename): return
+    directory = DATA_DIR / "avatars"
+    if directory.is_symlink() or not directory.is_dir(): return
+    try:
+        with connect() as con:
+            if con.execute("SELECT 1 FROM nova_profiles WHERE avatar_filename=? LIMIT 1", (filename,)).fetchone(): return
+        (directory / filename).unlink(missing_ok=True)
+    except (OSError, sqlite3.Error):
+        pass  # DB changes are already committed; an orphan is safer than deleting another file.
+
+
 def store_avatar(user_id: int, encoded: object) -> None:
     """Decode, validate and re-encode a local image, never store the original bytes."""
     if not isinstance(encoded, str) or len(encoded) > 520_000:
@@ -840,18 +867,28 @@ def store_avatar(user_id: int, encoded: object) -> None:
     except (UnidentifiedImageError, OSError, Image.DecompressionBombError, Image.DecompressionBombWarning) as exc:
         raise ValueError("Resim okunamadı") from exc
     directory = DATA_DIR / "avatars"
+    if directory.is_symlink(): raise ValueError("Profil resim klasörü güvenli değil")
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if directory.is_symlink(): raise ValueError("Profil resim klasörü güvenli değil")
     filename = secrets.token_hex(24) + ".png"
     target = directory / filename
     with target.open("xb") as f:
         os.chmod(target, 0o600)
         f.write(result.getvalue())
     try:
-        with DB_LOCK, connect() as con:
-            con.execute("INSERT INTO nova_profiles(user_id,avatar_filename) VALUES (?,?) ON CONFLICT(user_id) DO UPDATE SET avatar_filename=excluded.avatar_filename", (user_id, filename))
-            rbac._audit(con, user_id, "profile.avatar.updated", "user", user_id)
+        with DB_LOCK:
+            with connect() as con:
+                previous = con.execute("SELECT avatar_filename FROM nova_profiles WHERE user_id=?", (user_id,)).fetchone()
+                old_avatar = previous[0] if previous else ""
+                con.execute("INSERT INTO nova_profiles(user_id,avatar_filename) VALUES (?,?) ON CONFLICT(user_id) DO UPDATE SET avatar_filename=excluded.avatar_filename", (user_id, filename))
+                rbac._audit(con, user_id, "profile.avatar.updated", "user", user_id)
+            _discard_avatar_if_unused(old_avatar)
     except Exception:
-        target.unlink(missing_ok=True)
+        # Only remove the new file if the database does not reference it. A cleanup
+        # error after commit must not turn a valid profile into a broken reference.
+        with DB_LOCK, connect() as con:
+            used = con.execute("SELECT 1 FROM nova_profiles WHERE avatar_filename=? LIMIT 1", (filename,)).fetchone()
+        if not used: target.unlink(missing_ok=True)
         raise
 
 
@@ -939,7 +976,7 @@ get('/api/profile').then(d=>{if(d.permissions.includes('agent.chat')&&d.permissi
 """
 
 ADMIN_BODY = r"""
-<div class="admin-shell"><button class="admin-menu-toggle" id="menuToggle" aria-label="Menüyü aç">☰</button><div class="drawer-backdrop" id="adminDrawer"><aside class="sidebar"><button class="icon-btn drawer-close" id="menuClose" aria-label="Menüyü kapat">×</button><div class="brand" id="adminBrand">MERKEZ</div><div class="tag">Yönetim paneli</div><nav><div class="tag">Genel</div><button class="nav-btn active" data-view="overview">Genel bakış</button><button class="nav-btn" data-view="texts">Yazılar & görünüm</button><button class="nav-btn" data-view="contacts">İletişim</button><div class="tag" style="margin-top:12px">Erişim Yönetimi</div><button class="nav-btn" data-view="users">Kullanıcılar</button><button class="nav-btn" data-view="roles">Roller</button><button class="nav-btn" data-view="groups">Gruplar</button><div class="tag" style="margin-top:12px">Araçlar</div><button class="nav-btn" data-view="tools">Sunucu Araçları</button><button class="nav-btn" data-view="lab">Maviorkide Terminal</button><button class="nav-btn" data-view="workspace">Maviorkide Dosyalar</button><div class="tag" style="margin-top:12px">OpenClaw · hazırlık</div><button class="nav-btn" data-view="agentchat">Agent Sohbet</button><button class="nav-btn" data-view="agentmodels">Yerel Modeller</button><div class="tag" style="margin-top:12px">Ayarlar</div><button class="nav-btn" data-view="security">Yönetici parolası</button><button class="nav-btn" id="logout">Çıkış</button></nav></aside></div><main class="admin-main"><header class="admin-header"><div><div class="eyebrow">Yönetici</div><h1 style="margin:5px 0" id="viewTitle">Genel bakış</h1></div><a class="btn" href="/" target="_blank">Ana sayfayı aç</a></header>
+<div class="admin-shell"><button class="admin-menu-toggle" id="menuToggle" aria-label="Menüyü aç">☰</button><div class="drawer-backdrop" id="adminDrawer"><aside class="sidebar"><button class="icon-btn drawer-close" id="menuClose" aria-label="Menüyü kapat">×</button><div class="brand" id="adminBrand">MERKEZ</div><div class="tag">Yönetim paneli</div><nav><div class="tag">Genel</div><button class="nav-btn active" data-view="overview">Genel bakış</button><button class="nav-btn" data-view="texts">Yazılar & görünüm</button><button class="nav-btn" data-view="contacts">İletişim</button><div class="tag" style="margin-top:12px">Erişim Yönetimi</div><button class="nav-btn" data-view="users">Kullanıcılar</button><button class="nav-btn" data-view="roles">Roller</button><button class="nav-btn" data-view="groups">Gruplar</button><button class="nav-btn" data-view="audit">İşlem kayıtları</button><div class="tag" style="margin-top:12px">Araçlar</div><button class="nav-btn" data-view="tools">Sunucu Araçları</button><button class="nav-btn" data-view="lab">Maviorkide Terminal</button><button class="nav-btn" data-view="workspace">Maviorkide Dosyalar</button><div class="tag" style="margin-top:12px">OpenClaw · hazırlık</div><button class="nav-btn" data-view="agentchat">Agent Sohbet</button><button class="nav-btn" data-view="agentmodels">Yerel Modeller</button><div class="tag" style="margin-top:12px">Ayarlar</div><button class="nav-btn" data-view="security">Yönetici parolası</button><button class="nav-btn" id="logout">Çıkış</button></nav></aside></div><main class="admin-main"><header class="admin-header"><div><div class="eyebrow">Yönetici</div><h1 style="margin:5px 0" id="viewTitle">Genel bakış</h1></div><a class="btn" href="/" target="_blank">Ana sayfayı aç</a></header>
 <section class="view active" id="view-overview"><div class="settings-grid"><article class="panel setting-card"><div class="tag">Aktif standart kullanıcı</div><div class="value" id="standardCount">0</div></article><article class="panel setting-card"><div class="tag">Aktif özel kullanıcı</div><div class="value" id="specialCount">0</div></article><article class="panel setting-card"><div class="tag">Ana sayfa</div><p class="muted">Başlıklar, renkler ve iletişim bilgileri bu panelden anlık değiştirilebilir.</p></article><article class="panel setting-card"><div class="tag">Gizlilik</div><p class="muted">Standart kullanıcı listesi ve oturum bilgileri ana sayfada gösterilmez.</p></article></div><article class="panel setting-card server-summary" id="serverSummary"><div class="eyebrow">Canlı sunucu özeti</div><h2 class="section-title">Sunucu durumu yükleniyor…</h2><p class="muted">Access Hub, Ollama, kaynaklar, aktif kullanıcılar ve sorunlar kontrol ediliyor.</p></article></section>
 <section class="view" id="view-texts"><form class="settings-grid" id="textForm"><article class="panel setting-card"><h2 class="section-title">Yazılar</h2><div class="field"><label>Sol üst marka yazısı</label><input name="brand_text" maxlength="90"></div><div class="field"><label>Ana başlık</label><textarea name="home_heading" maxlength="500"></textarea></div><div class="field"><label>Açıklama</label><textarea name="home_subtitle" maxlength="1800"></textarea></div></article><article class="panel setting-card"><h2 class="section-title">Renk & ton</h2><div class="field"><label>Vurgu rengi</label><input name="accent_color" type="color"></div><div class="field"><label>Yazı tonu</label><input name="text_tone" type="color"></div><div class="field"><label>Panel parlaklığı</label><input name="surface_brightness" type="range" min="5" max="40"><small id="brightnessValue" class="muted"></small></div><button class="btn primary">Değişiklikleri kaydet</button><div class="notice" id="textNotice"></div></article></form></section>
 <section class="view" id="view-contacts"><form class="panel setting-card" id="contactForm"><h2 class="section-title">İletişim bilgileri</h2><p class="muted">Boş bıraktığınız alan ana sayfada görünmez.</p><div class="settings-grid"><div><div class="field"><label>Telefon</label><input name="contact_phone"></div><div class="field"><label>E-posta</label><input name="contact_email" type="email"></div><div class="field"><label>WhatsApp</label><input name="contact_whatsapp"></div></div><div><div class="field"><label>Instagram / sosyal medya</label><input name="contact_instagram"></div><div class="field"><label>Adres / açıklama</label><textarea name="contact_address"></textarea></div></div></div><button class="btn primary">İletişim bilgilerini kaydet</button><div class="notice" id="contactNotice"></div></form></section>
@@ -956,6 +993,7 @@ ADMIN_BODY = r"""
 <form class="panel setting-card" id="groupMemberForm"><h2 class="section-title">Grup üyeliği</h2><div class="field"><label>Grup</label><select id="memberGroupSelect" required></select></div><div class="field"><label>Kullanıcı</label><select id="memberUserSelect" required></select></div><button class="btn primary" name="action" value="add">Ekle</button> <button class="btn" name="action" value="remove">Çıkar</button><div class="notice" id="memberNotice"></div></form>
 <form class="panel setting-card" id="groupRoleForm"><h2 class="section-title">Gruba rol bağla</h2><div class="field"><label>Grup</label><select id="roleGroupSelect" required></select></div><div class="field"><label>Rol</label><select id="groupRoleSelect" required></select></div><button class="btn primary" name="action" value="add">Bağla</button> <button class="btn" name="action" value="remove">Kaldır</button><div class="notice" id="groupRoleNotice"></div></form>
 </div></section>
+<section class="view" id="view-audit"><section class="panel setting-card"><h2 class="section-title">İşlem kayıtları</h2><p class="muted">Parolalar, sohbet içerikleri ve terminal komutları kaydedilmez. Burada yalnız kayıt altına alınan işlemler gösterilir.</p><button class="btn" id="auditRefresh">Yenile</button> <button class="btn" id="auditOlder" disabled>Daha eski</button><p class="notice" id="auditNotice"></p><ol id="auditList"></ol></section></section>
 <section class="view" id="view-agentmodels"><div class="user-layout"><section class="panel setting-card"><h2 class="section-title">Ollama modelleri</h2><p class="muted">Gerçek model adı değiştirilemez. Bir model seçip erişimini düzenleyin.</p><div id="agentInventory">Yükleniyor…</div></section><form class="panel setting-card" id="agentModelForm"><h2 class="section-title">Model ayarları</h2><div class="field"><label>Gerçek model</label><select id="agentModelTag" required></select></div><div class="field"><label>Görünen ad</label><input id="agentModelName" maxlength="100" required></div><div class="field"><label>Açıklama</label><textarea id="agentModelDescription" maxlength="1000"></textarea></div><div class="field"><label>Sistem talimatı</label><textarea id="agentModelPrompt" maxlength="4000"></textarea></div><label><input type="checkbox" id="agentModelActive"> Etkin</label><br><label><input type="checkbox" id="agentModelDefault"> Varsayılan</label><div class="field"><label>İzinli roller (birden fazla seçilebilir)</label><select multiple id="agentModelRoles"></select></div><div class="field"><label>İzinli gruplar (birden fazla seçilebilir)</label><select multiple id="agentModelGroups"></select></div><button class="btn primary">Kaydet</button><div class="notice" id="agentModelNotice"></div></form></div></section>
 <section class="view" id="view-agentchat"><div class="user-layout"><section class="panel setting-card"><h2 class="section-title">Yerel agent sohbeti</h2><p class="muted">Bu ilk sürüm doğrudan yerel Ollama ile konuşur. OpenClaw köprüsü ve proje komutları henüz etkin değildir.</p><div class="field"><label>Model</label><select id="chatModel"></select></div><div class="field"><label>Konuşma geçmişi</label><select id="chatConversations"><option value="">Yeni konuşma</option></select></div><button class="btn" id="chatNew" type="button">Yeni konuşma</button> <button class="btn danger" id="chatDelete" type="button">Seçili konuşmayı sil</button><pre class="terminal" id="chatMessages" style="white-space:pre-wrap;overflow-wrap:anywhere"></pre><form id="chatForm"><div class="field"><label>Mesaj</label><textarea id="chatInput" maxlength="6000" required></textarea></div><button class="btn primary">Gönder</button><div class="notice" id="chatNotice"></div></form></section></div></section>
 <section class="view" id="view-tools"><section class="panel setting-card"><div class="eyebrow">Admin araçları</div><h2 class="section-title">Sunucu Araçları</h2><p class="muted">Bu ekran yalnız yöneticiye açıktır. Güvenlik nedeniyle rastgele shell komutu değil, izinli tanı komutları çalıştırılır. Tam Ubuntu terminali için SSH kullanılır.</p><div class="tool-grid"><button class="btn" data-terminal="status">Sistem özeti</button><button class="btn" data-terminal="uptime">Çalışma süresi</button><button class="btn" data-terminal="disk">Disk</button><button class="btn" data-terminal="memory">Bellek</button><button class="btn" data-terminal="models">Modeller</button><button class="btn" data-terminal="services">Servisler</button><button class="btn" data-terminal="logs">Access Hub logları</button></div><pre class="terminal" id="terminalOutput">Bir araç seçin. Komutlar yönetici için izinli ve kayıtlı tanı komutlarıyla sınırlıdır.</pre></section></section>
@@ -974,7 +1012,7 @@ Use lowercase python or python3.  Type commands below.</pre><div class="termux-s
 <section class="view" id="view-security"><form class="panel setting-card" id="passwordForm" style="max-width:620px"><div class="eyebrow">Güvenlik</div><h2 class="section-title">Yönetici parolasını değiştir</h2><div class="field"><label>Mevcut parola</label><input name="current" type="password" required></div><div class="field"><label>Yeni parola</label><input name="new" type="password" minlength="12" required></div><button class="btn primary">Parolayı değiştir</button><div class="notice" id="passwordNotice"></div></form></section>
 </main></div>
 <script>
-let state=window.__STATE__;const q=s=>document.querySelector(s);const titles={overview:'Genel bakış',texts:'Yazılar & görünüm',contacts:'İletişim',users:'Kullanıcılar',roles:'Roller',groups:'Gruplar',agentchat:'Agent Sohbet',agentmodels:'Yerel Modeller',tools:'Araçlar',lab:'Maviorkide Terminal',workspace:'Maviorkide Dosyalar',security:'Yönetici parolası'};function safe(v){return String(v||'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[m]))}async function api(path,body,method='POST'){const r=await fetch(path,{method,headers:{'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined});const d=await r.json().catch(()=>({}));if(!r.ok)throw new Error(d.error||'İşlem gerçekleştirilemedi');return d}function notice(s,t,ok=false){q(s).textContent=t;q(s).style.color=ok?'#9df6bf':'#ffcc86'}
+let state=window.__STATE__;const q=s=>document.querySelector(s);const titles={overview:'Genel bakış',texts:'Yazılar & görünüm',contacts:'İletişim',users:'Kullanıcılar',roles:'Roller',groups:'Gruplar',audit:'İşlem kayıtları',agentchat:'Agent Sohbet',agentmodels:'Yerel Modeller',tools:'Araçlar',lab:'Maviorkide Terminal',workspace:'Maviorkide Dosyalar',security:'Yönetici parolası'};function safe(v){return String(v||'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[m]))}async function api(path,body,method='POST'){const r=await fetch(path,{method,headers:{'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined});const d=await r.json().catch(()=>({}));if(!r.ok)throw new Error(d.error||'İşlem gerçekleştirilemedi');return d}function notice(s,t,ok=false){q(s).textContent=t;q(s).style.color=ok?'#9df6bf':'#ffcc86'}
 function fill(){const s=state.settings;q('#adminBrand').textContent=s.brand_text;q('#textForm').querySelectorAll('[name]').forEach(e=>e.value=s[e.name]||'');q('#contactForm').querySelectorAll('[name]').forEach(e=>e.value=s[e.name]||'');q('#brightnessValue').textContent=s.surface_brightness+' / 40';const active=state.users.filter(u=>u.active);q('#standardCount').textContent=active.filter(u=>u.role==='standard').length;q('#specialCount').textContent=active.filter(u=>u.role==='special').length;renderUsers();fillUserDetailsOptions()}
 function renderUsers(){q('#usersTable').innerHTML=state.users.map(u=>`<tr><td><b>${safe(u.display_name)}</b><br><small class="muted">${safe(u.username)}</small></td><td><span class="pill">${u.role==='admin'?'Yönetici':u.role==='special'?'Özel':'Standart'}</span></td><td>${u.active?'Aktif':'Pasif'}</td><td>${u.role==='admin'?'<span class="muted">Korunan</span>':`<div class="actions"><button class="btn" data-user-detail="${u.id}">Detay</button><button class="btn" data-toggle="${u.id}">${u.active?'Pasifleştir':'Etkinleştir'}</button><button class="btn" data-reset="${u.id}">Key/şifre</button><button class="btn danger" data-delete="${u.id}">Sil</button></div>`}</td></tr>`).join('');q('#usersTable').querySelectorAll('[data-user-detail]').forEach(b=>b.onclick=()=>{q('#userDetailSelect').value=b.dataset.userDetail;loadUserDetail()});q('#usersTable').querySelectorAll('[data-toggle]').forEach(b=>b.onclick=()=>changeActive(b.dataset.toggle));q('#usersTable').querySelectorAll('[data-delete]').forEach(b=>b.onclick=()=>deleteUser(b.dataset.delete));q('#usersTable').querySelectorAll('[data-reset]').forEach(b=>b.onclick=()=>resetCredential(b.dataset.reset))}
 async function reload(){state=await fetch('/api/admin/state').then(r=>r.json());fill()}async function changeActive(id){const u=state.users.find(x=>x.id==id);await api('/api/admin/users/'+id+'/active',{active:!u.active});reload()}async function deleteUser(id){if(confirm('Bu kullanıcı silinsin mi?')){await api('/api/admin/users/'+id,null,'DELETE');reload()}}async function resetCredential(id){const v=prompt('Yeni key/şifre (en az 8 karakter):');if(v) {await api('/api/admin/users/'+id+'/credential',{credential:v});alert('Bilgi güncellendi.');}}
@@ -1027,6 +1065,8 @@ q('#userRoleForm').onsubmit=e=>{e.preventDefault();assign('user-role',q('#roleUs
 q('#groupMemberForm').onsubmit=e=>{e.preventDefault();assign('group-member',q('#memberGroupSelect').value,q('#memberUserSelect').value,e.submitter?.value!=='remove','#memberNotice')};
 q('#groupRoleForm').onsubmit=e=>{e.preventDefault();assign('group-role',q('#roleGroupSelect').value,q('#groupRoleSelect').value,e.submitter?.value!=='remove','#groupRoleNotice')};
 document.querySelectorAll('[data-view="roles"],[data-view="groups"]').forEach(b=>b.addEventListener('click',loadAccess));
+let auditCursor=null;async function loadAudit(older=false){try{const url='/api/admin/audit'+(older&&auditCursor?'?before='+encodeURIComponent(auditCursor):'');const r=await fetch(url),d=await r.json();if(!r.ok)throw Error(d.error||'Kayıtlar alınamadı');const list=q('#auditList');if(!older)list.replaceChildren();d.events.forEach(e=>{const row=document.createElement('li');row.textContent=new Date(e.created_at*1000).toLocaleString()+' · '+(e.actor_username||'silinmiş hesap')+' · '+e.event_type+' · '+e.subject_type+' #'+e.subject_id;list.append(row)});auditCursor=d.next_before;q('#auditOlder').disabled=!auditCursor;notice('#auditNotice',d.events.length?'':'Kayıt bulunamadı.',true)}catch(e){notice('#auditNotice',e.message)}}
+q('#auditRefresh').onclick=()=>loadAudit();q('#auditOlder').onclick=()=>loadAudit(true);q('[data-view="audit"]').addEventListener('click',()=>loadAudit());
 
 
 let agentInventory=[],agentConfigured=[],agentRoles=[],agentGroups=[],chatConversation=null;
@@ -1141,6 +1181,11 @@ class Handler(BaseHTTPRequestHandler):
             elif user["role"] == "admin":
                 self.redirect("/admin")
             else:
+                with DB_LOCK, connect() as con:
+                    allowed = rbac.has_permission(con, int(user["id"]), "portal.view")
+                if not allowed:
+                    self.send_json(HTTPStatus.FORBIDDEN, {"error": "Özel alan için yetkiniz yok"})
+                    return
                 self.send_bytes(HTTPStatus.OK, page("Özel Alan", PRIVATE_BODY, {"user": user}))
         elif path == "/admin":
             user = self.user()
@@ -1244,6 +1289,21 @@ class Handler(BaseHTTPRequestHandler):
                 groups = [dict(item) for item in con.execute("SELECT g.id,g.group_key,g.display_name,g.active FROM nova_groups g JOIN nova_group_members gm ON gm.group_id=g.id WHERE gm.user_id=? ORDER BY g.display_name", (user_id,))]
                 permissions = sorted(rbac.effective_permissions(con, user_id))
             self.send_json(HTTPStatus.OK, {"user": user_info, "roles": roles, "groups": groups, "permissions": permissions})
+        elif path == "/api/admin/audit":
+            if not self.require_admin_permission("system.logs"): return
+            values = parse_qs(urlparse(self.path).query).get("before", [])
+            try:
+                before = int(values[0]) if len(values) == 1 else (None if not values else -1)
+                if before is not None and not 1 <= before <= 9223372036854775807:
+                    raise ValueError("invalid cursor")
+            except ValueError:
+                self.send_json(HTTPStatus.BAD_REQUEST, {"error": "Geçersiz kayıt sayfası"}); return
+            with DB_LOCK, connect() as con:
+                entries = [dict(row) for row in con.execute("""SELECT e.id,e.actor_user_id,u.username AS actor_username,
+                    e.event_type,e.subject_type,e.subject_id,e.created_at FROM nova_audit_events e
+                    LEFT JOIN users u ON u.id=e.actor_user_id
+                    WHERE (? IS NULL OR e.id < ?) ORDER BY e.id DESC LIMIT 100""", (before, before))]
+            self.send_json(HTTPStatus.OK, {"events": entries, "next_before": entries[-1]["id"] if len(entries)==100 else None})
         elif path == "/api/admin/system/status":
             if self.require_admin_permission("system.status"):
                 self.send_json(HTTPStatus.OK, system_overview())
@@ -1262,7 +1322,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not user:
                     self.send_json(HTTPStatus.UNAUTHORIZED, {"error": "Kullanıcı adı veya key doğru değil"})
                     return
-                self.send_json(HTTPStatus.OK, {"redirect": "/private"}, self.session_header(create_session(int(user["id"]))))
+                self.send_json(HTTPStatus.OK, {"redirect": "/private"}, self.session_header(create_session(int(user["id"]), audit=True)))
             elif path == "/api/login/special":
                 data = self.body_json()
                 if str(data.get("user_id")) == "admin":
@@ -1274,9 +1334,9 @@ class Handler(BaseHTTPRequestHandler):
                 if not user:
                     self.send_json(HTTPStatus.UNAUTHORIZED, {"error": "Şifre doğru değil veya hesap erişime kapalı"})
                     return
-                self.send_json(HTTPStatus.OK, {"redirect": redirect}, self.session_header(create_session(int(user["id"]))))
+                self.send_json(HTTPStatus.OK, {"redirect": redirect}, self.session_header(create_session(int(user["id"]), audit=True)))
             elif path == "/api/logout":
-                delete_session(self.token())
+                delete_session(self.token(), audit=True)
                 self.send_json(HTTPStatus.OK, {"ok": True}, self.clear_session_header())
             elif path == "/api/agent/chat":
                 user = self.require_user()
@@ -1376,9 +1436,14 @@ class Handler(BaseHTTPRequestHandler):
                 data = self.body_json()
                 self.send_json(HTTPStatus.OK, maviorkide_terminal(str(data.get("command", "")), data.get("cwd", ".")))
             elif path == "/api/admin/maviorkide/lab-command":
-                if not self.require_permission("tools.terminal"): return
+                actor = self.require_permission("tools.terminal")
+                if not actor: return
                 if not self.require_permission("tools.repo.command"): return
                 data = self.body_json()
+                # Record who requested a command, never the command or its output.
+                # Commit before executing so audit failure cannot lead to a hidden action.
+                with DB_LOCK, connect() as con:
+                    rbac._audit(con, int(actor["id"]), "repo.command.requested", "user", int(actor["id"]))
                 self.send_json(HTTPStatus.OK, mavi_repo_lab_command(str(data.get("command", "")), data.get("cwd", ".")))
             elif path == "/api/admin/settings":
                 actor = self.require_admin_permission("settings.home.manage")

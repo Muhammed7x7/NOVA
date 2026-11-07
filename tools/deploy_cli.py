@@ -8,6 +8,7 @@ is required for a mutating operation. See README for limitations.
 import argparse
 import os
 import signal
+import json
 from contextlib import contextmanager
 from pathlib import Path
 import stat
@@ -15,7 +16,7 @@ import subprocess
 import sysconfig
 
 from tools import deploy_candidate, deploy_preflight
-from tools.systemd_adapter import SystemdService
+from tools.systemd_adapter import SystemdService, ServiceCheckError
 
 
 def private_directory(path: Path, app_dir: Path) -> Path:
@@ -35,7 +36,6 @@ def execute(action, app_dir, destination, vendor, service, *, lab_inspector=None
     destination=private_directory(Path(destination),app_dir)
     if action=='preflight':
         return deploy_preflight.run_preflight(app_dir,vendor,destination,service,lab_inspector)
-    service.inspect()
     if action=='apply':
         # Dry-run and snapshot the actual current DB before the service is touched.
         deploy_preflight.run_preflight(app_dir,vendor,destination,service,lab_inspector)
@@ -43,7 +43,14 @@ def execute(action, app_dir, destination, vendor, service, *, lab_inspector=None
         return deploy_candidate.deploy(app_dir,destination,vendor,service)
     if action=='rollback':
         if rollback_dir is None:raise ValueError('Rollback backup path required')
-        service.healthy(candidate=True)
+        try:
+            service.inspect()
+            service.healthy(candidate=True)
+        except (OSError, ValueError, ServiceCheckError, subprocess.SubprocessError):
+            # A broken candidate may have no PID/listener. The unit itself must
+            # still match the known app and service user before it can be stopped.
+            manifest=json.loads((Path(rollback_dir)/'deploy-manifest.json').read_text())
+            service.inspect_config_stopped(manifest.get('port'))
         (sudo_check or check_sudo)()
         deploy_candidate.rollback(app_dir,Path(rollback_dir),service)
         return Path(rollback_dir)
