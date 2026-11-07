@@ -1,5 +1,11 @@
 # Access Hub Next (development only)
 
+## Deployment status and UI redesign
+
+The operator reported applying revision `dfca9fd8e68878fdf7a1ec50811f692f8ea274b4` on Oracle and seeing `access-hub.service` active. The redesigned UI in this branch has **not** been applied to that server. Existing documentation below describes the earlier development and rehearsal process; those warnings and limitations remain relevant, but statements that nothing has been installed predate the operator's reported installation.
+
+**Do not rerun `tools.deploy_cli --apply` as an update:** that installer expects the original baseline `app.py`, not the already-installed release wrapper. A separate, version-aware update and recovery procedure is required before deploying this redesign. OpenClaw and Telegram are not implemented; the existing chat uses local Ollama directly.
+
 This repository contains a development copy of the user's Access Hub and a partial upgrade. It is **not a deployment package** and must not be installed on a production server yet. No OpenClaw gateway or Repo Lab bridge is implemented here.
 
 ## Local test

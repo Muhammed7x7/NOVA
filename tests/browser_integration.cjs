@@ -10,20 +10,44 @@ if(!/^http:\/\/127\.0\.0\.1:\d+$/.test(base||'')) throw Error('Only a temporary 
  try{
   const desktop=await browser.newContext({viewport:{width:1280,height:900}}),page=await desktop.newPage();
   page.on('pageerror',e=>errors.push(e.message));
-  await page.goto(base);await page.locator('#specialOpen').click();await page.locator('#specialChoices [data-id="admin"]').click();
+  await page.goto(base);
+  assert(await page.locator('#standardForm').isVisible());
+  assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
+  await page.locator('#specialOpen').click();await page.locator('#specialChoices [data-id="admin"]').click();
   await page.locator('#specialPassword').fill('temporary-password-123');await page.locator('#specialPasswordForm button[type="submit"],#specialPasswordForm button:not([type])').first().click();
   await page.waitForURL('**/admin');assert(await page.locator('#menuToggle').isVisible());
-  async function navigate(view){await page.locator('#menuToggle').click();await page.locator(`[data-view="${view}"]`).click();await page.locator('#menuClose').click();}
+  async function navigate(view){
+   await page.locator('#menuToggle').click();
+   const item=page.locator(`.nav-btn[data-view="${view}"]`);
+   await item.evaluate(el=>{const details=el.closest('details');if(details)details.open=true});
+   await item.click();
+   assert.equal(await page.locator('#menuToggle').getAttribute('aria-expanded'),'false');
+  }
+  await page.locator('#menuToggle').click();
+  assert.deepStrictEqual(await page.locator('.nav-group-label').allTextContents(),['Genel','Erişim Yönetimi','Araçlar','Sistem','Ayarlar']);
+  await page.locator('#openClawNav > summary').click();
+  assert.deepStrictEqual(await page.locator('#openClawNav .nav-btn').allTextContents(),['Agent Sohbet','Konuşmalar','Yerel Modeller','Agent Yetkileri','Agent Ayarları','Bağlantılar / Telegram']);
+  await page.keyboard.press('Escape');assert.equal(await page.locator('#menuToggle').getAttribute('aria-expanded'),'false');
+  await navigate('connections');assert(await page.locator('#view-connections').getByText('Henüz kullanılamıyor').isVisible());
+  await navigate('agentsettings');assert(await page.locator('#view-agentsettings').getByText('Henüz kullanılamıyor').isVisible());
+  await navigate('ollama');await page.locator('#ollamaInventory').getByText('test:model').waitFor();
+  await navigate('tools');await page.locator('#serviceSummary').getByText(/access-hub/).waitFor();
   await navigate('roles');await page.locator('#roleCreate [name=key]').fill('test-role');await page.locator('#roleCreate [name=display_name]').fill('Test Role');await page.locator('#roleCreate button').click();await page.locator('#roleNotice').getByText('Rol oluşturuldu.').waitFor();
-  await navigate('groups');await page.locator('#groupCreate [name=key]').fill('test-group');await page.locator('#groupCreate [name=display_name]').fill('Test Group');await page.locator('#groupCreate button').click();await page.locator('#groupNotice').getByText('Grup oluşturuldu.').waitFor();
+  assert.equal(await page.locator('#view-roles .user-layout').evaluate(e=>getComputedStyle(e).gridTemplateColumns.split(' ').length),1);
+  await navigate('groups');assert.equal(await page.locator('#view-groups .user-layout').evaluate(e=>getComputedStyle(e).gridTemplateColumns.split(' ').length),1);await page.locator('#groupCreate [name=key]').fill('test-group');await page.locator('#groupCreate [name=display_name]').fill('Test Group');await page.locator('#groupCreate button').click();await page.locator('#groupNotice').getByText('Grup oluşturuldu.').waitFor();
   await navigate('audit');await page.locator('#auditList').getByText(/role.created/).first().waitFor();
   await page.locator('#profileToggle').click();await page.locator('#profileName').fill('Yeni İsim');await page.locator('#profileNameForm button').click();await page.getByText('Görünen ad kaydedildi.').waitFor();await page.locator('#profileClose').click();
   await navigate('agentmodels');await page.locator('#agentModelTag option[value="test:model"]').waitFor({state:"attached"});await page.locator('#agentModelTag').selectOption('test:model');assert.equal(await page.locator('#agentModelName').inputValue(),'Test model');
   await navigate('agentchat');await page.locator('#chatModel option[value="test:model"]').waitFor({state:"attached"});await page.locator('#chatModel').selectOption('test:model');await page.locator('#chatInput').fill('merhaba');await page.locator('#chatForm button').click();await page.locator('#chatMessages').getByText('Yanıt: merhaba').waitFor();
+  await navigate('conversations');await page.locator('#historyList button').first().click();await page.locator('#historyContent').getByText('Yanıt: merhaba').waitFor();
+  await page.setViewportSize({width:390,height:844});
+  await navigate('users');assert.equal(await page.locator('#view-users .user-layout').evaluate(e=>getComputedStyle(e).gridTemplateColumns.split(' ').length),1);
+  assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
+  assert(await page.locator('#profileToggle').isVisible());
   await desktop.close();await browser.close();
   browser=await playwright.launch({executablePath:await chromium.executablePath(),args,headless:true});
   const mobile=await browser.newContext({viewport:{width:390,height:844},isMobile:true,hasTouch:true}),mp=await mobile.newPage();mp.on('pageerror',e=>errors.push(e.message));
-  await mp.goto(base);await mp.locator('#standardForm [name=username]').fill('tester');await mp.locator('#standardForm [name=key]').fill('tester-password');await mp.locator('#standardForm button').click();await mp.waitForURL('**/private');
+  await mp.goto(base);assert.equal(await mp.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);await mp.locator('#standardForm [name=username]').fill('tester');await mp.locator('#standardForm [name=key]').fill('tester-password');await mp.locator('#standardForm button').click();await mp.waitForURL('**/private');
   await mp.locator('#normalMenuToggle').click();await mp.locator('#privateRepoOpen').click();
   await mp.locator('#privateRepoInput').fill('echo hello');await mp.locator('#privateRepoForm button').click();await mp.locator('#privateRepoNotice').getByText('Maviorkide Repo Laboratuvarı çalışmıyor').waitFor();
   await mp.locator('#privateRepoClose').click();await mp.locator('#normalMenuToggle').click();await mp.locator('#privateAgentOpen').click();await mp.locator('#privateAgentModel option[value="test:model"]').waitFor({state:"attached"});await mp.locator('#privateAgentModel').selectOption('test:model');
