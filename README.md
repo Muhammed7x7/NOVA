@@ -15,7 +15,7 @@ Tests use temporary SQLite databases; model responses are mocked. `baseline/app.
 ## Not yet validated / unfinished
 
 - The OpenClaw gateway, per-user isolation, model routing and a Repo Lab-only bridge are not implemented. Do not assume the local Ollama chat is OpenClaw.
-- The integration has not been tested against real Ollama, Docker, a production SQLite database, service unit, or the Oracle installation. No installer/rollback script is provided.
+- The integration has not been tested against real Ollama, Docker, a production SQLite database, service unit, or the Oracle installation. No production-ready installer or rollback command is provided.
 - A limited headless Chromium smoke test covers desktop and mobile viewport sizes with a fake local Ollama service. It is not full browser/device coverage; role/group/user management remains incomplete.
 - Full audit coverage, avatar lifecycle/storage quotas, security review, model resource controls and durable user-specific agent memory are incomplete.
 - Secure cookies default to enabled, so production requires HTTPS. `ACCESS_HUB_INSECURE_DEV_COOKIE=1` is exclusively for local HTTP development; never enable it on a public deployment.
@@ -42,3 +42,9 @@ For staging and evaluation only, setting `ACCESS_HUB_LEGACY_CREDENTIAL_COMPAT=1`
 ## Repo Lab boundary checks
 
 Only authenticated users with both `tools.terminal` and `tools.repo.command` may run a Repo Lab command. Non-admin users can access this delegated terminal without acquiring access-management permissions. Before executing a command, the app inspects the named container and refuses to run if its expected non-root, capability, mount, resource or namespace configuration is missing. These checks are configuration checks, not proof of container isolation; they do not verify network isolation, Docker daemon security, kernel vulnerabilities, or prevent a privileged Docker operator from replacing a container between inspection and execution. The running service must itself use a non-root UID. Administrative management endpoints remain restricted to legacy admin accounts.
+
+## Experimental deployment research
+
+`tools/deploy_candidate.py` contains **non-CLI, experimental** deployment and source-only rollback building blocks, and `tools/systemd_adapter.py` has Linux/systemd safety checks. The code prepares a private release, validates the system interpreter and Pillow, stops through an injected service adapter, snapshots SQLite and the original app, tests migration on a copy, forces legacy-compatible credential writes, and attempts source-only recovery on failure. Tests use real local HTTP subprocesses with **simulated systemctl**; they do not prove that sudo, systemd, signals, service policies, filesystem permissions or recovery work on the Oracle instance. `tools/deploy_preflight.py` is a non-deploying preflight only. Do not invoke the deployment functions on production.
+
+Source-only rollback retains the live SQLite database rather than restoring the old backup, and refuses unknown credential hashes. It does not restore old feature behavior or remove newer tables, avatars, model configuration or conversations, and later changes made while running the old app may not receive the new roles automatically. If the database itself must be restored from an old backup, changes since that snapshot will be lost. The private backups omit tunnel configuration and the workspace. Both recovery methods still require a production-specific procedure and validation.
